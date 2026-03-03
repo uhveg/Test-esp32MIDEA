@@ -19,13 +19,26 @@
 
 static const char *TAG = "MIDEA_AC";
 
-/* ── Midea packet constants ─────────────────────────────── */
-#define MIDEA_SOF           0xAAU
-#define MIDEA_DEVTYPE       0xACU
+#define MIDEA_SOF    0xAAU
+#define MIDEA_DEVTYPE 0xACU
 
-/* Response type codes (pkt[10] in AC→dongle direction) */
-#define RSP_POWER           0xA0U  /* response to QueryPowerData  */
-#define RSP_STATUS          0xA1U  /* response to QueryStateData  */
+/* ── Response type codes sent by the AC ────────────────────
+ *
+ *  0xA0  Power usage data       (broadcast + response to QueryPower)
+ *  0xA1  Full status            (response to QueryState)
+ *  0xA2  Status broadcast       (AC sends spontaneously, same format as A1)
+ *  0xA3  Status broadcast       (same)
+ *  0xA5  Extended status        (timers, fan detail, etc.)
+ *  0xA6  Status broadcast       (same as A2/A3)
+ *  0xB5  Capabilities report    (AC sends when it thinks dongle reconnected)
+ */
+#define RSP_POWER    0xA0U
+#define RSP_STATUS_1 0xA1U
+#define RSP_STATUS_2 0xA2U
+#define RSP_STATUS_3 0xA3U
+#define RSP_STATUS_5 0xA5U
+#define RSP_STATUS_6 0xA6U
+#define RSP_CAPS     0xB5U
 
 /* ── CRC-8 (poly 0x31, init 0x00) ──────────────────────── */
 static uint8_t midea_crc8(const uint8_t *buf, size_t len)
@@ -40,25 +53,11 @@ static uint8_t midea_crc8(const uint8_t *buf, size_t len)
     return crc;
 }
 
-/* ── Packet builder ─────────────────────────────────────────
- *
- *  Full Midea UART frame:
- *    [0]     0xAA         SOF
- *    [1]     LEN          bytes from [1] to end (inclusive)
- *    [2]     0xAC         Device type
- *    [3]     0x00         Flags (dongle → AC direction)
- *    [4..7]  0x00 x4      Reserved
- *    [8]     0x00
- *    [9]     0x03         Fixed in TX direction
- *    [10..]  PAYLOAD      CMD byte + data bytes
- *    [n-1]   CRC8         over bytes [2..n-2]
- *    [n]     CHECKSUM     (0 - sum(bytes[1..n-1])) & 0xFF
- */
+/* ── Packet builder ─────────────────────────────────────── */
 static int midea_build_packet(uint8_t *out,
                               const uint8_t *payload, size_t payload_len)
 {
     uint8_t pkt_len = (uint8_t)(9 + payload_len + 2);
-
     int i = 0;
     out[i++] = MIDEA_SOF;
     out[i++] = pkt_len;
@@ -69,173 +68,195 @@ static int midea_build_packet(uint8_t *out,
     out[i++] = 0x00;
     out[i++] = 0x00;
     out[i++] = 0x00;
-    out[i++] = 0x03;    /* TX direction marker */
-
+    out[i++] = 0x03;
     memcpy(&out[i], payload, payload_len);
     i += payload_len;
-    {
-        uint8_t crc8 = midea_crc8(&out[2], i - 2);
-        out[i++] = crc8;
-    }
-
+    uint8_t crc8 = midea_crc8(&out[2], i - 2);
+    out[i++] = crc8;
     uint32_t sum = 0;
     for (int j = 1; j < i; j++) sum += out[j];
     out[i++] = (uint8_t)((0x100 - (sum & 0xFF)) & 0xFF);
-
     return i;
 }
 
-/* ── Query payloads ─────────────────────────────────────────
- *  Exact bytes from dudanov/MideaUART StatusData.h:
+/* ── Network Status Notification ───────────────────────────
  *
- *  QueryStateData: {0x41, 0x81, 0x00, 0xFF, 0x03, 0xFF,
- *                   0x00, 0x02, 0x00×12, 0x03, ID}
+ *  This is the 0x0D command. It tells the AC:
+ *    "The WiFi dongle is connected to the network."
+ *  Without it, the AC periodically sends B5 capability probes
+ *  (visible in your log) and may remove the WiFi icon from its display.
+ *  Must be sent at least every 2 minutes.
  *
- *  QueryPowerData: {0x41, 0x21, 0x01, 0x44, 0x00×17, 0x04, ID}
- *    ↑ key: byte[1]=0x21, byte[2]=0x01, byte[3]=0x44
- *      these three tell the AC to return power meter data
+ *  Payload: {0x0D, 0x01, [IP4 bytes], [router_IP4], 0x00, ssid_len, ...}
+ *  A minimal all-zeros version is accepted by most models.
  */
-static const uint8_t QUERY_STATE_PAYLOAD[] = {
-    0x41, 0x81, 0x00, 0xFF, 0x03, 0xFF, 0x00, 0x02,
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x00, 0x03, 0x00
+static const uint8_t NOTIFY_NETWORK_PAYLOAD[] = {
+    0x0D,                               /* CMD: network notification  */
+    0x01,                               /* connected = true           */
+    0x00, 0x00, 0x00, 0x00,             /* dongle IP (0 = unknown ok) */
+    0x00, 0x00, 0x00, 0x00,             /* router IP                  */
+    0x00,                               /* signal strength            */
+    0x00                                /* SSID length = 0            */
 };
 
-static const uint8_t QUERY_POWER_PAYLOAD[] = {
-    0x41, 0x21, 0x01, 0x44, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x04, 0x00
-};
-
-/* ── Response validation ────────────────────────────────────
- *
- *  Fixed checks (wrong in previous version):
- *    ✗ pkt[9]  == 0x03  →  that's only in TX direction; RX has 0x04 / 0x05
- *    ✗ pkt[10] == 0x41  →  that's the request CMD; responses use 0xA0, 0xA1...
- */
-static bool midea_validate_response(const uint8_t *pkt, int len)
+/* ── Validation ─────────────────────────────────────────── */
+static bool midea_validate(const uint8_t *pkt, int len)
 {
-    if (len < 12)                    return false;
-    if (pkt[0] != MIDEA_SOF)         return false;
-    if (pkt[2] != MIDEA_DEVTYPE)     return false;
-    if ((int)(pkt[1] + 1) > len)     return false; /* LEN byte sanity */
+    if (len < 12)                          return false;
+    if (pkt[0] != MIDEA_SOF)               return false;
+    if (pkt[2] != MIDEA_DEVTYPE)           return false;
+    if ((int)(pkt[1] + 1) > len)           return false;
     return true;
 }
 
-/* ── Parse power usage from 0xA0 response ───────────────────
+/* ── Is this a status-type response (A1/A2/A3/A5/A6)? ─────
  *
- *  Power response layout (verified from your captured bytes):
- *    pkt[10] = 0xA0   ← response type for QueryPowerData
- *    pkt[11] = power high byte
- *    pkt[12] = power mid  byte
- *    pkt[13] = power low  byte
- *
- *  Example from your log:
- *    A0 09 20 65 → raw = 0x092065 = 598117 → 598117/10 = 59811 Wh ≈ 59.8 kWh
- *
- *  Returns cumulative Wh, or -1.0f if wrong response type / too short.
+ *  All of these share the same payload layout as A1.
+ *  A5 has extra fields starting around pkt[33] (timer/fan detail)
+ *  but the core status bytes are identical.
  */
-static float midea_parse_power(const uint8_t *pkt, int len)
+static bool is_status_type(uint8_t t)
 {
-    if (!midea_validate_response(pkt, len)) return -1.0f;
-    if (pkt[10] != RSP_POWER)               return -1.0f;
-    if (len < 14)                           return -1.0f;
-
-    uint32_t raw = ((uint32_t)pkt[11] << 16)
-                 | ((uint32_t)pkt[12] << 8)
-                 |  (uint32_t)pkt[13];
-
-    return (float)raw / 10.0f;  /* Wh */
+    return (t == RSP_STATUS_1 || t == RSP_STATUS_2 ||
+            t == RSP_STATUS_3 || t == RSP_STATUS_5 ||
+            t == RSP_STATUS_6);
 }
 
-/* ── Parse indoor temperature from 0xA1 response ────────────
- *
- *  Verified from your log:
- *    pkt[23] = 0x61 = 97 → (97 - 50) / 2.0 = 23.5°C  ✓
- *    pkt[25] bit0 = half-degree flag (+0.5°C if set)
- */
-static float midea_parse_indoor_temp(const uint8_t *pkt, int len)
-{
-    if (!midea_validate_response(pkt, len)) return -99.0f;
-    if (pkt[10] != RSP_STATUS)              return -99.0f;
-    if (len < 26)                           return -99.0f;
-
-    float temp = (pkt[23] - 50) / 2.0f;
-    if (pkt[25] & 0x0F) temp += 0.5f;      /* half-degree bit */
-    return temp;
-}
-
-/* ── Parse outdoor temperature from 0xA1 response ───────────
- *
- *  Verified from your log:
- *    pkt[24] = 0xFF → outdoor not available (AC off)
- *    Normal range: 0x00..0xFE → (byte - 50) / 2.0
- */
-static float midea_parse_outdoor_temp(const uint8_t *pkt, int len)
-{
-    if (!midea_validate_response(pkt, len)) return -99.0f;
-    if (pkt[10] != RSP_STATUS)              return -99.0f;
-    if (len < 25)                           return -99.0f;
-    if (pkt[24] == 0xFF)                    return -99.0f; /* not available */
-
-    return (pkt[24] - 50) / 2.0f;
-}
-
-/* ── Parse power on/off from 0xA1 response ──────────────────
- *
- *  StatusData.h m_getPower() → m_getValue(1, 1) = byte[1] bit0
- *  In full packet: frame byte[1] = pkt[11]
- */
+/* ── Parse power on/off ─────────────────────────────────── */
 static bool midea_parse_power_on(const uint8_t *pkt, int len)
 {
-    if (!midea_validate_response(pkt, len)) return false;
-    if (pkt[10] != RSP_STATUS)              return false;
-    if (len < 12)                           return false;
-
+    if (len < 12) return false;
     return (pkt[11] & 0x01) != 0;
 }
 
-/* ── Parse mode from 0xA1 response ─────────────────────────
- *
- *  StatusData.h getRawMode() → m_getValue(2, 7, 5) = byte[2] bits[7:5]
- *  In full packet: frame byte[2] = pkt[12]
- */
+/* ── Parse mode ─────────────────────────────────────────── */
 static const char *midea_parse_mode(const uint8_t *pkt, int len)
 {
-    if (!midea_validate_response(pkt, len) || pkt[10] != RSP_STATUS || len < 13)
-        return "UNKNOWN";
-
+    if (len < 13) return "?";
     static const char *modes[] = {
         "AUTO", "AUTO", "COOL", "DRY", "HEAT", "FAN_ONLY", "?", "?"
     };
     return modes[(pkt[12] >> 5) & 0x07];
 }
 
-/* ── Parse target temp from 0xA1 response ───────────────────
- *
- *  StatusData.h getTargetTemp() → byte[2] bits[3:0] + 16
- *  frame byte[2] = pkt[12]
- *  Half-degree bit in pkt[23] bit4 (same byte as indoor temp)
- */
+/* ── Parse fan speed ────────────────────────────────────── */
+static const char *midea_parse_fan(const uint8_t *pkt, int len)
+{
+    if (len < 14) return "?";
+    uint8_t spd = pkt[13] & 0x7F;
+    if (spd == 102) return "AUTO";
+    if (spd >= 80)  return "HIGH";
+    if (spd >= 60)  return "MEDIUM";
+    if (spd >= 40)  return "LOW";
+    if (spd >= 20)  return "SILENT";
+    return "AUTO";
+}
+
+/* ── Parse target temperature ───────────────────────────── */
 static float midea_parse_target_temp(const uint8_t *pkt, int len)
 {
-    if (!midea_validate_response(pkt, len) || pkt[10] != RSP_STATUS || len < 24)
-        return -99.0f;
-
+    if (len < 24) return -99.0f;
     float temp = (float)((pkt[12] & 0x0F) + 16);
     if (pkt[23] & 0x10) temp += 0.5f;
     return temp;
 }
 
-/* ── Find 0xAA start byte in buffer ────────────────────────*/
-static int midea_find_start(const uint8_t *buf, int len)
+/* ── Parse indoor temperature ───────────────────────────── */
+static float midea_parse_indoor_temp(const uint8_t *pkt, int len)
 {
-    for (int i = 0; i < len; i++)
-        if (buf[i] == MIDEA_SOF) return i;
-    return -1;
+    if (len < 24) return -99.0f;
+    float temp = (pkt[23] - 50) / 2.0f;
+    if (len >= 26 && (pkt[25] & 0x0F)) temp += 0.5f;
+    return temp;
 }
 
-/* ── Main task ──────────────────────────────────────────────*/
+/* ── Parse outdoor temperature ──────────────────────────── */
+static float midea_parse_outdoor_temp(const uint8_t *pkt, int len)
+{
+    if (len < 25)        return -99.0f;
+    if (pkt[24] == 0xFF) return -99.0f;
+    return (pkt[24] - 50) / 2.0f;
+}
+
+/* ── Parse power usage from 0xA0 ───────────────────────── */
+static float midea_parse_power(const uint8_t *pkt, int len)
+{
+    if (len < 14)            return -1.0f;
+    if (pkt[10] != RSP_POWER) return -1.0f;
+    uint32_t raw = ((uint32_t)pkt[11] << 16)
+                 | ((uint32_t)pkt[12] << 8)
+                 |  (uint32_t)pkt[13];
+    return (float)raw / 10.0f;
+}
+
+/* ── Parse B5 capabilities ──────────────────────────────────
+ *
+ *  B5 payload: {0xB5, 0x01, count, [id, len, val, ...], ...}
+ *  We just log the key powerCal flag (id=0x10, byte 0x06 bit1).
+ *  Full decode requires iterating all capability TLV entries.
+ */
+static void midea_parse_b5(const uint8_t *pkt, int len)
+{
+    /* pkt[10]=0xB5, pkt[11]=0x01, pkt[12]=count of items */
+    if (len < 13) return;
+    ESP_LOGI(TAG, "  [B5] Capabilities packet (%d items)", pkt[12]);
+
+    /* Scan for powerCal capability (ID = 0x10, sub-ID = 0x06) */
+    int i = 13;
+    while (i + 2 < len - 2) {   /* -2 = skip CRC+CS at tail */
+        uint8_t cap_id  = pkt[i];
+        uint8_t cap_sub = pkt[i + 1];
+        uint8_t cap_val = pkt[i + 2];
+        if (cap_id == 0x10 && cap_sub == 0x06) {
+            ESP_LOGI(TAG, "  [B5] powerCal (power metering) : %s",
+                     (cap_val & 0x01) ? "SUPPORTED" : "not supported");
+        }
+        i += 3;
+    }
+}
+
+/* ── Decode and print a single validated packet ─────────── */
+static void midea_decode_packet(const uint8_t *pkt, int len)
+{
+    uint8_t rsp = pkt[10];
+
+    if (rsp == RSP_POWER) {
+        float power = midea_parse_power(pkt, len);
+        if (power >= 0.0f)
+            ESP_LOGI(TAG, "[A0] Power usage : %.1f Wh  (%.3f kWh)",
+                     power, power / 1000.0f);
+
+    } else if (is_status_type(rsp)) {
+        /* A1=queried, A2/A3/A6=spontaneous broadcast, A5=extended */
+        const char *src = (rsp == RSP_STATUS_1) ? "queried"
+                        : (rsp == RSP_STATUS_5) ? "extended"
+                        : "broadcast";
+        ESP_LOGI(TAG, "[%02X] Status (%s) ─────────────────", rsp, src);
+        ESP_LOGI(TAG, "  Power  : %s",
+                 midea_parse_power_on(pkt, len) ? "ON" : "OFF");
+        ESP_LOGI(TAG, "  Mode   : %s",  midea_parse_mode(pkt, len));
+        ESP_LOGI(TAG, "  Fan    : %s",  midea_parse_fan(pkt, len));
+
+        float t_set = midea_parse_target_temp(pkt, len);
+        float t_in  = midea_parse_indoor_temp(pkt, len);
+        float t_out = midea_parse_outdoor_temp(pkt, len);
+
+        if (t_set > -90.0f) ESP_LOGI(TAG, "  Target : %.1f °C", t_set);
+        if (t_in  > -90.0f) ESP_LOGI(TAG, "  Indoor : %.1f °C", t_in);
+        if (t_out > -90.0f) ESP_LOGI(TAG, "  Outdoor: %.1f °C", t_out);
+        else                ESP_LOGI(TAG, "  Outdoor: N/A (unit off)");
+
+    } else if (rsp == RSP_CAPS) {
+        midea_parse_b5(pkt, len);
+
+    } else {
+        /* Log unknown types at DEBUG level so they don't spam */
+        ESP_LOGD(TAG, "[%02X] unhandled type (%d bytes)", rsp, len);
+        ESP_LOG_BUFFER_HEX("  raw", pkt, len);
+    }
+}
+
+/* ── Main task ──────────────────────────────────────────── */
 static void echo_task(void *arg)
 {
     uart_config_t uart_config = {
@@ -246,122 +267,88 @@ static void echo_task(void *arg)
         .flow_ctrl  = UART_HW_FLOWCTRL_DISABLE,
         .source_clk = UART_SCLK_DEFAULT,
     };
-
     int intr_alloc_flags = 0;
 #if CONFIG_UART_ISR_IN_IRAM
     intr_alloc_flags = ESP_INTR_FLAG_IRAM;
 #endif
-
     ESP_ERROR_CHECK(uart_driver_install(ECHO_UART_PORT_NUM, BUF_SIZE * 2, 0, 0,
                                         NULL, intr_alloc_flags));
     ESP_ERROR_CHECK(uart_param_config(ECHO_UART_PORT_NUM, &uart_config));
     ESP_ERROR_CHECK(uart_set_pin(ECHO_UART_PORT_NUM, ECHO_TEST_TXD, ECHO_TEST_RXD,
                                  ECHO_TEST_RTS, ECHO_TEST_CTS));
 
-    uint8_t *rx_buf = (uint8_t *) malloc(BUF_SIZE);
-    uint8_t  pkt_state[64], pkt_power[64];
+    uint8_t *rx_buf  = (uint8_t *) malloc(BUF_SIZE);
+    uint8_t  pkt_notify[32];
+    int      len_notify = midea_build_packet(pkt_notify,
+                                              NOTIFY_NETWORK_PAYLOAD,
+                                              sizeof(NOTIFY_NETWORK_PAYLOAD));
 
-    int len_state = midea_build_packet(pkt_state, QUERY_STATE_PAYLOAD,
-                                       sizeof(QUERY_STATE_PAYLOAD));
-    int len_power = midea_build_packet(pkt_power, QUERY_POWER_PAYLOAD,
-                                       sizeof(QUERY_POWER_PAYLOAD));
+    ESP_LOGI(TAG, "=== Midea AC passive monitor ready ===");
+    ESP_LOGI(TAG, "Listening only — AC sends status every ~2-5 seconds");
+    ESP_LOG_BUFFER_HEX("Network notify TX", pkt_notify, len_notify);
 
-    ESP_LOGI(TAG, "=== Midea AC UART monitor ready ===");
-    ESP_LOG_BUFFER_HEX("QueryState TX", pkt_state, len_state);
-    ESP_LOG_BUFFER_HEX("QueryPower TX", pkt_power, len_power);
+    /* Send network notification immediately on boot */
+    uart_write_bytes(ECHO_UART_PORT_NUM, pkt_notify, len_notify);
+    ESP_LOGI(TAG, "TX → Network notification sent");
 
-    bool query_power = false;
+    TickType_t last_notify = xTaskGetTickCount();
 
     while (1) {
-        /* ── Send query ──────────────────────────────── */
-        if (query_power) {
-            uart_write_bytes(ECHO_UART_PORT_NUM, pkt_power, len_power);
-            ESP_LOGI(TAG, "TX → QueryPower");
-        } else {
-            uart_write_bytes(ECHO_UART_PORT_NUM, pkt_state, len_state);
-            ESP_LOGI(TAG, "TX → QueryState");
+        /* ── Send network notification every 90 seconds ──
+         *
+         *  This keeps the WiFi icon on the AC display and
+         *  stops the AC from flooding us with B5 probes.
+         */
+        if ((xTaskGetTickCount() - last_notify) > pdMS_TO_TICKS(90000)) {
+            uart_write_bytes(ECHO_UART_PORT_NUM, pkt_notify, len_notify);
+            ESP_LOGI(TAG, "TX → Network notification (keepalive)");
+            last_notify = xTaskGetTickCount();
         }
 
-        /* ── Read response ───────────────────────────── */
+        /* ── Read whatever the AC is broadcasting ────────
+         *
+         *  50ms timeout: short enough to catch multi-packet
+         *  bursts without busy-waiting.
+         */
         int len = uart_read_bytes(ECHO_UART_PORT_NUM, rx_buf,
-                                  BUF_SIZE - 1, 500 / portTICK_PERIOD_MS);
+                                  BUF_SIZE - 1, 50 / portTICK_PERIOD_MS);
 
-        if (len <= 0) {
-            ESP_LOGW(TAG, "No response from AC unit");
-            query_power = !query_power;
-            vTaskDelay(pdMS_TO_TICKS(5000));
-            continue;
-        }
+        if (len <= 0) continue;
 
-        ESP_LOG_BUFFER_HEX("RX raw", rx_buf, len);
+        ESP_LOG_BUFFER_HEX("RX", rx_buf, len);
 
-        /* ── Scan all packets in the buffer ──────────── */
+        /* ── Scan all packets in the buffer ─────────────── */
         int offset = 0;
         while (offset < len) {
-            /* Find next 0xAA */
+            /* Find next 0xAA start byte */
             int start = -1;
             for (int i = offset; i < len; i++) {
                 if (rx_buf[i] == MIDEA_SOF) { start = i; break; }
             }
             if (start < 0) break;
 
-            const uint8_t *pkt     = &rx_buf[start];
-            int            pkt_avail = len - start;
+            const uint8_t *pkt      = &rx_buf[start];
+            int            available = len - start;
 
-            /* Need at least 2 bytes to read LEN field */
-            if (pkt_avail < 2) break;
+            if (available < 2) break;
 
-            int expected_total = pkt[1] + 1;  /* LEN + AA byte */
+            int expected = pkt[1] + 1;   /* LEN field + the 0xAA byte */
 
-            if (pkt_avail < expected_total) {
-                /* Incomplete packet – would need to read more bytes */
-                ESP_LOGW(TAG, "Incomplete packet at offset %d "
-                         "(have %d, need %d)", start, pkt_avail, expected_total);
+            if (available < expected) {
+                /* Incomplete — will catch the rest next read */
+                ESP_LOGD(TAG, "Incomplete packet (have %d / need %d)",
+                         available, expected);
                 break;
             }
 
-            if (!midea_validate_response(pkt, expected_total)) {
-                ESP_LOGW(TAG, "Invalid packet at offset %d, "
-                         "type=0x%02X", start, pkt[10]);
+            if (!midea_validate(pkt, expected)) {
                 offset = start + 1;
                 continue;
             }
 
-            /* ── Decode by response type ──────────────── */
-            uint8_t rsp_type = pkt[10];
-            ESP_LOGI(TAG, "── Packet type 0x%02X (%d bytes) ────", rsp_type, expected_total);
-
-            if (rsp_type == RSP_POWER) {
-                float power = midea_parse_power(pkt, expected_total);
-                if (power >= 0.0f)
-                    ESP_LOGI(TAG, "  Power usage : %.1f Wh (%.3f kWh)",
-                             power, power / 1000.0f);
-
-            } else if (rsp_type == RSP_STATUS) {
-                ESP_LOGI(TAG, "  Power on    : %s",
-                         midea_parse_power_on(pkt, expected_total) ? "YES" : "NO");
-                ESP_LOGI(TAG, "  Mode        : %s",
-                         midea_parse_mode(pkt, expected_total));
-
-                float t_set = midea_parse_target_temp(pkt, expected_total);
-                float t_in  = midea_parse_indoor_temp(pkt, expected_total);
-                float t_out = midea_parse_outdoor_temp(pkt, expected_total);
-
-                if (t_set > -90.0f) ESP_LOGI(TAG, "  Target temp : %.1f °C", t_set);
-                if (t_in  > -90.0f) ESP_LOGI(TAG, "  Indoor temp : %.1f °C", t_in);
-                if (t_out > -90.0f) ESP_LOGI(TAG, "  Outdoor temp: %.1f °C", t_out);
-                else                ESP_LOGI(TAG, "  Outdoor temp: N/A");
-
-            } else {
-                ESP_LOGI(TAG, "  (unhandled response type 0x%02X)", rsp_type);
-            }
-
-            ESP_LOGI(TAG, "────────────────────────────────────");
-            offset = start + expected_total;
+            midea_decode_packet(pkt, expected);
+            offset = start + expected;
         }
-
-        query_power = !query_power;
-        vTaskDelay(pdMS_TO_TICKS(5000));
     }
 }
 
