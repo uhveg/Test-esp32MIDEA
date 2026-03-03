@@ -52,11 +52,11 @@ static uint8_t midea_crc8(const uint8_t *buf, size_t len)
  *  `payload` = the raw bytes array from the FrameData constructor
  *  (already includes CMD byte + data, CRC8 is appended here)
  */
-static int midea_build_packet(uint8_t *out,
-                              const uint8_t *payload, size_t payload_len)
+static int midea_build_packet(uint8_t *out, const uint8_t *payload, size_t payload_len)
 {
     /* LEN = 9 fixed header bytes after LEN + payload + CRC8 + CS */
     uint8_t pkt_len = (uint8_t)(9 + payload_len + 2);
+    ESP_LOGI(TAG, "Building packet: LEN=%d, payload_len=%d", pkt_len, payload_len);
 
     int i = 0;
     out[i++] = MIDEA_SOF;      /* [0]   0xAA */
@@ -72,17 +72,20 @@ static int midea_build_packet(uint8_t *out,
 
     memcpy(&out[i], payload, payload_len);
     i += payload_len;
+    ESP_LOGI(TAG, "Payload copied, i=%d", i);
 
     /* CRC8 over [2 .. i-1] */
     {
         uint8_t crc = midea_crc8(&out[2], i - 2);
         out[i++] = crc;
     }
+    ESP_LOGI(TAG, "CRC8 calculated, i=%d", i);
 
     /* Checksum = (0 - sum(out[1..i-1])) & 0xFF */
     uint32_t sum = 0;
     for (int j = 1; j < i; j++) sum += out[j];
     out[i++] = (uint8_t)((0x100 - (sum & 0xFF)) & 0xFF);
+    ESP_LOGI(TAG, "Checksum calculated, i=%d", i);
 
     return i;
 }
@@ -259,9 +262,6 @@ static void echo_task(void *arg)
     };
 
     int intr_alloc_flags = 0;
-#if CONFIG_UART_ISR_IN_IRAM
-    intr_alloc_flags = ESP_INTR_FLAG_IRAM;
-#endif
     ESP_ERROR_CHECK(uart_driver_install(ECHO_UART_PORT_NUM, BUF_SIZE * 2, 0, 0, NULL, intr_alloc_flags));
     ESP_ERROR_CHECK(uart_param_config(ECHO_UART_PORT_NUM, &uart_config));
     ESP_ERROR_CHECK(uart_set_pin(ECHO_UART_PORT_NUM, ECHO_TEST_TXD, ECHO_TEST_RXD, ECHO_TEST_RTS, ECHO_TEST_CTS));
