@@ -239,16 +239,6 @@ static int midea_find_start(const uint8_t *buf, int len)
     return -1;
 }
 
-/* ── Helper: log raw bytes ──────────────────────────────────*/
-static void log_hex(const char *label, const uint8_t *buf, int len)
-{
-    char hex[BUF_SIZE * 3];
-    int pos = 0;
-    for (int i = 0; i < len && pos < (int)sizeof(hex) - 4; i++)
-        pos += sprintf(&hex[pos], "%02X ", buf[i]);
-    ESP_LOGI(TAG, "%s [%d bytes]: %s", label, len, hex);
-}
-
 /* ── Main task ──────────────────────────────────────────────*/
 static void echo_task(void *arg)
 {
@@ -276,8 +266,8 @@ static void echo_task(void *arg)
     int     len_power = midea_build_packet(pkt_power, QUERY_POWER_PAYLOAD, sizeof(QUERY_POWER_PAYLOAD));
 
     ESP_LOGI(TAG, "=== Midea AC UART monitor ready ===");
-    log_hex("QueryState packet", pkt_state, len_state);
-    log_hex("QueryPower packet", pkt_power, len_power);
+    esp_log_buffer_hex("QueryState packet", pkt_state, len_state);
+    esp_log_buffer_hex("QueryPower packet", pkt_power, len_power);
 
     /* Alternate between state and power queries */
     bool query_power = false;
@@ -301,7 +291,7 @@ static void echo_task(void *arg)
         if (len <= 0) {
             ESP_LOGW(TAG, "No response from AC unit");
         } else {
-            log_hex("RX raw", rx_buf, len);
+            esp_log_buffer_hex("RX raw", rx_buf, len);
 
             /* Locate packet start (skip any noise) */
             int start = midea_find_start(rx_buf, len);
